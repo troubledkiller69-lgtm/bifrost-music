@@ -33,9 +33,8 @@ class BifrostMusicBot(commands.Bot):
     """Custom Bot class managing intents, cogs, slash command synchronization, and health check endpoint."""
 
     def __init__(self):
-        # Configure required Intents
+        # Configure standard non-privileged Intents for Slash Commands
         intents = discord.Intents.default()
-        intents.message_content = True
         intents.voice_states = True
 
         super().__init__(
