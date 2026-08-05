@@ -137,6 +137,33 @@ Koyeb provides free micro-instance containers.
 
 ---
 
+### Option C: Deploying to a Linux VPS (Ubuntu/Debian)
+If you purchased a traditional VPS (like DigitalOcean, Hetzner, or AWS EC2), the easiest and cleanest way to run the bot 24/7 is using Docker.
+
+1. SSH into your VPS and install Git and Docker:
+   ```bash
+   sudo apt update
+   sudo apt install git docker.io -y
+   ```
+2. Clone your repository:
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/bifrost_music.git
+   cd bifrost_music
+   ```
+3. Create your `.env` file and add your tokens (Docker will read from this):
+   ```bash
+   nano .env
+   # Add your DISCORD_TOKEN, SPOTIFY_CLIENT_ID, etc. here, then save (Ctrl+O, Enter, Ctrl+X)
+   ```
+4. Build and run the Docker container in the background (detached mode):
+   ```bash
+   sudo docker build -t bifrost-music .
+   sudo docker run -d --env-file .env --name bifrost-bot bifrost-music
+   ```
+   *(To view the live console logs later, run: `sudo docker logs -f bifrost-bot`)*
+
+---
+
 ## 🎮 Slash Command Reference
 
 | Command | Arguments | Description |

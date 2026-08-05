@@ -12,6 +12,7 @@ class Song:
     title: str
     stream_url: str
     webpage_url: str
+    video_id: str
     duration: int
     thumbnail: str
     uploader: str
@@ -32,7 +33,7 @@ class YouTubeService:
     """Service to handle audio extraction via yt-dlp."""
 
     YTDL_OPTIONS = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
         'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
         'restrictfilenames': True,
         'noplaylist': True,
@@ -43,6 +44,14 @@ class YouTubeService:
         'no_warnings': True,
         'default_search': 'ytsearch',
         'source_address': '0.0.0.0',  # Bind to IPv4
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android', 'web'],
+            }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        },
     }
 
     FFMPEG_OPTIONS = {
@@ -61,13 +70,16 @@ class YouTubeService:
         loop = asyncio.get_event_loop()
 
         # Run extraction in executor to avoid blocking the asyncio event loop
+        # Set default_search to YouTube Music in the class definition.
         def _extract():
             try:
-                # If not a URL, use ytsearch
+                # Pass the raw query or URL; yt-dlp will use the default_search parameter natively
                 search_target = query_or_url
-                if not (query_or_url.startswith("http://") or query_or_url.startswith("https://")):
-                    search_target = f"ytsearch:{query_or_url}"
-
+                # Append "official audio" to searches to prevent music videos with dialogue from playing
+                if not (search_target.startswith("http://") or search_target.startswith("https://")):
+                    if "official audio" not in search_target.lower():
+                        search_target = f"{search_target} official audio"
+                        
                 info = self.ytdl.extract_info(search_target, download=False)
                 
                 # Handle search result list
@@ -95,6 +107,7 @@ class YouTubeService:
             title=info.get('title', 'Unknown Title'),
             stream_url=stream_url,
             webpage_url=info.get('webpage_url', query_or_url),
+            video_id=info.get('id', ''),
             duration=int(info.get('duration') or 0),
             thumbnail=info.get('thumbnail', ''),
             uploader=info.get('uploader', 'Unknown Artist'),
