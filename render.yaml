@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: bifrost-music-bot
     runtime: docker
     plan: free

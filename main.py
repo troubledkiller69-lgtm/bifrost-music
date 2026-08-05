@@ -5,6 +5,7 @@ import asyncio
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+from aiohttp import web
 
 # Configure Logging
 logging.basicConfig(
@@ -29,7 +30,7 @@ if not DISCORD_TOKEN:
     sys.exit(1)
 
 class BifrostMusicBot(commands.Bot):
-    """Custom Bot class managing intents, cogs, and slash command synchronization."""
+    """Custom Bot class managing intents, cogs, slash command synchronization, and health check endpoint."""
 
     def __init__(self):
         # Configure required Intents
@@ -43,8 +44,28 @@ class BifrostMusicBot(commands.Bot):
             help_command=None
         )
 
+    async def _start_healthcheck_server(self):
+        """Start a lightweight HTTP health check server for Render free web service hosting."""
+        try:
+            app = web.Application()
+            app.router.add_get("/", lambda r: web.Response(text="Bifrost Music Bot is operational!"))
+            app.router.add_get("/health", lambda r: web.Response(text="OK"))
+            
+            runner = web.AppRunner(app)
+            await runner.setup()
+            
+            port = int(os.getenv("PORT", 8080))
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
+            logger.info(f"Health check HTTP server listening on port {port}.")
+        except Exception as e:
+            logger.error(f"Failed to start health check server: {e}")
+
     async def setup_hook(self):
         """Async initialization hook before the bot connects to Discord."""
+        # Start health check endpoint for cloud hosters (Render/Koyeb)
+        await self._start_healthcheck_server()
+
         logger.info("Loading extensions...")
         try:
             await self.load_extension("cogs.music")
