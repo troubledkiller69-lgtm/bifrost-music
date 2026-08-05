@@ -46,7 +46,7 @@ class MusicCog(commands.Cog):
     async def _ensure_voice_connection(
         self, interaction: discord.Interaction, g_queue: GuildQueue
     ) -> Optional[discord.VoiceClient]:
-        """Ensure the bot is connected to the caller's voice channel."""
+        """Ensure the bot is connected to the caller's voice channel with extended timeout for cloud hosting."""
         if not interaction.user.voice or not interaction.user.voice.channel:
             embed = discord.Embed(
                 title="⚠️ Voice Channel Required",
@@ -62,15 +62,35 @@ class MusicCog(commands.Cog):
         user_channel = interaction.user.voice.channel
         voice_client = interaction.guild.voice_client
 
-        if voice_client is None:
-            voice_client = await user_channel.connect(reconnect=True, self_deaf=True)
-            g_queue.voice_client = voice_client
-        elif voice_client.channel != user_channel:
-            await voice_client.move_to(user_channel)
-            g_queue.voice_client = voice_client
+        try:
+            if voice_client is None:
+                # Use 60 second extended timeout for cloud container network handshakes
+                voice_client = await user_channel.connect(timeout=60.0, reconnect=True, self_deaf=True)
+            elif voice_client.channel != user_channel:
+                try:
+                    await voice_client.move_to(user_channel)
+                except Exception:
+                    await voice_client.disconnect(force=True)
+                    voice_client = await user_channel.connect(timeout=60.0, reconnect=True, self_deaf=True)
+            elif not voice_client.is_connected():
+                await voice_client.disconnect(force=True)
+                voice_client = await user_channel.connect(timeout=60.0, reconnect=True, self_deaf=True)
 
-        g_queue.voice_client = voice_client
-        return voice_client
+            g_queue.voice_client = voice_client
+            return voice_client
+
+        except (asyncio.TimeoutError, discord.errors.ClientException) as e:
+            logger.error(f"Voice connection error in guild {interaction.guild_id}: {e}")
+            embed = discord.Embed(
+                title="⚠️ Voice Connection Timeout",
+                description="Failed to complete voice handshake with Discord servers. Please try running `/play` again.",
+                color=discord.Color.red()
+            )
+            if not interaction.response.is_done():
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+            else:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            return None
 
     async def _play_next(self, guild_id: int, error: Optional[Exception] = None):
         """Callback to handle playing the next song in the guild queue."""
@@ -353,7 +373,10 @@ class MusicCog(commands.Cog):
         g_queue.clear()
 
         if g_queue.voice_client:
-            await g_queue.voice_client.disconnect()
+            try:
+                await g_queue.voice_client.disconnect(force=True)
+            except Exception:
+                pass
             g_queue.voice_client = None
 
         embed = discord.Embed(
