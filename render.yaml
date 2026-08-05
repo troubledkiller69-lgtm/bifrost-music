@@ -1,9 +1,10 @@
 services:
   - type: web
     name: bifrost-music-bot
-    runtime: docker
+    env: docker
     plan: free
     dockerfilePath: Dockerfile
+    healthCheckPath: /health
     autoDeploy: true
     envVars:
       - key: DISCORD_TOKEN
