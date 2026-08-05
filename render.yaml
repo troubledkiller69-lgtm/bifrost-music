@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: bifrost-music-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: Dockerfile
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: DEV_GUILD_ID
+        sync: false

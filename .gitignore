@@ -1,0 +1,13 @@
+# Environment variables & secrets (CRITICAL: do not push tokens to GitHub)
+.env
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# IDE files
+.vscode/
+.idea/
