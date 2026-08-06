@@ -1,6 +1,9 @@
 import asyncio
+import json
 import logging
-from typing import Dict, Optional, List
+import os
+import time
+from typing import Dict, Optional, List, Set
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -17,7 +20,7 @@ class GuildQueue:
         self.guild_id = guild_id
         self.queue: List[Song] = []
         self.current: Optional[Song] = None
-        self.loop: bool = False
+        self.loop_mode: str = "off"  # "off", "track", "queue"
         self.autoplay: bool = False
         self.volume: float = 0.8
         self.filter_options: str = ""
@@ -25,12 +28,19 @@ class GuildQueue:
         self.text_channel: Optional[discord.TextChannel] = None
         self.now_playing_message: Optional[discord.Message] = None
         self.play_lock = asyncio.Lock()
+        self.notify_users: Set[int] = set()  # user IDs who want DM notifications
+        self.dedication: Optional[dict] = None  # {"from": user, "to": member}
+        self.play_start_time: Optional[float] = None  # epoch time when current track started
+        self.autoplay_history: List[str] = []  # titles of recently played songs for dedup
 
     def clear(self):
         """Reset queue state."""
         self.queue.clear()
         self.current = None
         self.now_playing_message = None
+        self.dedication = None
+        self.play_start_time = None
+        self.autoplay_history.clear()
 
 class MusicPlayerView(discord.ui.View):
     def __init__(self, cog: 'MusicCog', guild_id: int):
@@ -57,7 +67,7 @@ class MusicPlayerView(discord.ui.View):
     async def skip_track(self, interaction: discord.Interaction, button: discord.ui.Button):
         g_queue = self.cog.get_guild_queue(self.guild_id)
         if g_queue.voice_client and (g_queue.voice_client.is_playing() or g_queue.voice_client.is_paused()):
-            g_queue.loop = False
+            g_queue.loop_mode = "off"
             g_queue.voice_client.stop()
             await interaction.response.send_message("⏭️ Skipped track", ephemeral=True)
         else:
@@ -75,6 +85,34 @@ class MusicPlayerView(discord.ui.View):
     @discord.ui.button(emoji="📜", style=discord.ButtonStyle.secondary, custom_id="queue")
     async def show_queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.show_queue.callback(self.cog, interaction)
+
+STATS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "listening_stats.json")
+
+def _load_stats() -> dict:
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_stats(data: dict):
+    with open(STATS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def _record_play(guild_id: int, song_title: str, requester: str):
+    stats = _load_stats()
+    gid = str(guild_id)
+    if gid not in stats:
+        stats[gid] = {"songs": {}, "users": {}}
+    songs = stats[gid]["songs"]
+    songs[song_title] = songs.get(song_title, 0) + 1
+    users = stats[gid]["users"]
+    # strip mention formatting
+    clean = requester.replace("<@", "").replace(">", "").replace("!", "")
+    users[clean] = users.get(clean, 0) + 1
+    _save_stats(stats)
 
 class MusicCog(commands.Cog):
     """Cog handling music playback, voice connections, and slash commands."""
@@ -155,37 +193,143 @@ class MusicCog(commands.Cog):
             old_song = g_queue.current
 
             # Collapse previous playing message
-            if old_song and g_queue.now_playing_message and not g_queue.loop:
+            if old_song and g_queue.now_playing_message and g_queue.loop_mode != "track":
                 try:
                     collapsed = discord.Embed(
                         description=f"✅ **Finished:** [{old_song.title}]({old_song.webpage_url})",
                         color=discord.Color.light_grey()
                     )
-                    await g_queue.now_playing_message.edit(embed=collapsed, attachments=[])
+                    await g_queue.now_playing_message.edit(embed=collapsed, attachments=[], view=None)
                 except Exception:
                     pass
                 g_queue.now_playing_message = None
 
-            # Handle looping
-            if g_queue.loop and g_queue.current:
+            # Clear dedication after song finishes (unless track looping)
+            if g_queue.loop_mode != "track":
+                g_queue.dedication = None
+
+            # Handle loop modes
+            if g_queue.loop_mode == "track" and g_queue.current:
+                song_to_play = g_queue.current
+            elif g_queue.loop_mode == "queue" and g_queue.current and not g_queue.queue:
+                # Queue loop: re-append the old song and pop from front
+                # In queue loop, we re-add the finished song to the end
+                g_queue.queue.append(g_queue.current)
+                g_queue.current = g_queue.queue.pop(0)
+                song_to_play = g_queue.current
+            elif g_queue.loop_mode == "queue" and g_queue.current and g_queue.queue:
+                # Queue loop with items remaining: re-add current to end, pop next
+                g_queue.queue.append(g_queue.current)
+                g_queue.current = g_queue.queue.pop(0)
                 song_to_play = g_queue.current
             elif g_queue.queue:
                 g_queue.current = g_queue.queue.pop(0)
                 song_to_play = g_queue.current
             elif getattr(g_queue, 'autoplay', False) and old_song:
                 if g_queue.text_channel:
-                    await g_queue.text_channel.send("♾️ *Autoplay searching for next track...*", delete_after=5)
+                    await g_queue.text_channel.send("♾️ *Autoplay finding a related track...*", delete_after=5)
+
+                logger.info(f"Autoplay: triggered for '{old_song.title}' by '{old_song.uploader}'")
+
+                # Track history for dedup (keep last 30)
+                g_queue.autoplay_history.append(old_song.title)
+                if len(g_queue.autoplay_history) > 30:
+                    g_queue.autoplay_history = g_queue.autoplay_history[-30:]
+
+                new_song = None
+
+                import re as _re
+                import random
+
+                # Clean YouTube junk to make searches broader
+                def _clean_title(t: str) -> str:
+                    for pattern in [
+                        r'\(Official\s*(Audio|Video|Music\s*Video|Lyric\s*Video|Visualizer)\)',
+                        r'\[Official\s*(Audio|Video|Music\s*Video|Lyric\s*Video|Visualizer)\]',
+                        r'\(Lyrics?\)', r'\[Lyrics?\]',
+                        r'\(Audio\)', r'\[Audio\]',
+                        r'\(Explicit\)', r'\[Explicit\]',
+                        r'\(Official\)', r'\[Official\]',
+                        r'\(HD\)', r'\[HD\]', r'\(HQ\)', r'\[HQ\]',
+                        r'official audio', r'official video', r'official music video',
+                        r'lyrics', r'lyric video', r'\bHQ\b',
+                    ]:
+                        t = _re.sub(pattern, '', t, flags=_re.IGNORECASE)
+                    return t.strip().strip('-').strip()
+
+                def _clean_artist(a: str) -> str:
+                    a = _re.sub(r'VEVO$', '', a, flags=_re.IGNORECASE)
+                    a = _re.sub(r'\s*-\s*Topic$', '', a, flags=_re.IGNORECASE)
+                    a = _re.sub(r'Official$', '', a, flags=_re.IGNORECASE)
+                    return a.strip()
+
+                def _extract_artist_from_title(t: str) -> Optional[str]:
+                    if ' - ' in t:
+                        return t.split(' - ', 1)[0].strip()
+                    return None
+
+                clean_title = _clean_title(old_song.title)
+                clean_artist = _clean_artist(old_song.uploader)
+                title_artist = _extract_artist_from_title(clean_title)
+
+                if title_artist:
+                    search_artist = title_artist
+                    search_song = clean_title.split(' - ', 1)[1].strip()
+                else:
+                    search_artist = clean_artist
+                    search_song = clean_title
+
+                logger.info(f"Autoplay: cleaned artist='{search_artist}', song='{search_song}' (raw: '{old_song.title}', '{old_song.uploader}')")
+
                 try:
-                    new_song = await self.youtube_service.extract_song(f"{old_song.uploader} official audio", "🤖 Autoplay")
-                    if new_song:
-                        g_queue.current = new_song
-                        song_to_play = g_queue.current
+                    # Strategy: YouTube search with varied keywords for diversity
+                    # We avoid putting the exact song name to get different songs by the artist
+                    suffixes = [
+                        "best songs", "greatest hits", "popular songs", "playlist", "audio", "music", "live"
+                    ]
+                    suffix = random.choice(suffixes)
+                    
+                    # Sometimes search just the artist, sometimes artist + song + mix
+                    if random.random() > 0.5:
+                        fallback_query = f"{search_artist} {suffix}"
                     else:
-                        raise Exception("No related track found")
-                except Exception:
+                        fallback_query = f"{search_artist} {search_song} mix"
+                        
+                    logger.info(f"Autoplay: YouTube search: '{fallback_query}'")
+                    
+                    # We pass standard query, not appending 'official audio' here
+                    new_song = await self.youtube_service.extract_song(fallback_query, "🤖 Autoplay")
+                    
+                    # If it returns a dupe, try again one more time with a different approach
+                    if new_song and new_song.title in g_queue.autoplay_history:
+                        logger.info(f"Autoplay: YouTube returned dupe '{new_song.title}', trying random track")
+                        fallback_query = f"{search_artist} audio"
+                        # Trick yt-dlp to grab a few results by passing ytsearch5
+                        if not fallback_query.startswith("ytsearch"):
+                            fallback_query = f"ytsearch5:{fallback_query}"
+                            
+                        # Need to call yt-dlp differently to get a list, but for now just rely on ytsearch randomness
+                        # Actually, our extract_song only returns the *first* result. 
+                        # To fix dupes, let's just search something completely different
+                        fallback_query = f"top hits {search_artist}"
+                        new_song = await self.youtube_service.extract_song(fallback_query, "🤖 Autoplay")
+                        
+                        if new_song and new_song.title in g_queue.autoplay_history:
+                            new_song = None
+                            
+                    if new_song:
+                        logger.info(f"Autoplay: YouTube SUCCESS - playing '{new_song.title}'")
+                except Exception as e:
+                    logger.error(f"Autoplay: YouTube extraction failed: {e}")
+
+                if new_song:
+                    g_queue.current = new_song
+                    song_to_play = g_queue.current
+                else:
+                    logger.warning("Autoplay: all strategies failed, stopping")
                     g_queue.current = None
                     if g_queue.text_channel:
-                        embed = discord.Embed(title="🎵 Queue Finished", description="Autoplay failed to find a related track. Add more songs using `/play`!", color=discord.Color.purple())
+                        embed = discord.Embed(title="🎵 Queue Finished", description="Autoplay couldn't find a related track. Add more songs using `/play`!", color=discord.Color.purple())
                         await g_queue.text_channel.send(embed=embed)
                     return
             else:
@@ -221,9 +365,13 @@ class MusicCog(commands.Cog):
                         logger.error(f"Error in after_callback result: {e}")
 
                 g_queue.voice_client.play(transformed_source, after=after_callback)
+                g_queue.play_start_time = time.time()
+
+                # Record stats
+                _record_play(guild_id, song_to_play.title, song_to_play.requester)
 
                 # Send Now Playing notification
-                if g_queue.text_channel and not g_queue.loop:
+                if g_queue.text_channel and g_queue.loop_mode != "track":
                     embed = discord.Embed(
                         title="🎶 Now Playing",
                         description=f"**[{song_to_play.title}]({song_to_play.webpage_url})**",
@@ -234,12 +382,21 @@ class MusicCog(commands.Cog):
                     embed.add_field(name="🎧 Requested By", value=song_to_play.requester, inline=True)
                     embed.add_field(name="🎵 Filters", value=g_queue.filter_options if g_queue.filter_options else "None", inline=True)
                     embed.add_field(name="🔊 Volume", value=f"{int(g_queue.volume * 100)}%", inline=True)
+                    loop_display = {"off": "Off", "track": "Track", "queue": "Queue"}
+                    embed.add_field(name="🔁 Loop", value=loop_display.get(g_queue.loop_mode, "Off"), inline=True)
+
+                    # Dedication banner
+                    if g_queue.dedication:
+                        embed.add_field(
+                            name="💌 Dedicated",
+                            value=f"From {g_queue.dedication['from']} to {g_queue.dedication['to']}",
+                            inline=False
+                        )
                     
                     if song_to_play.thumbnail:
                         embed.set_thumbnail(url=song_to_play.thumbnail)
 
                     gif_path = r"C:\Users\howar\Downloads\tumblr_oaku5s68Qn1qf4kz5o1_1280.gif"
-                    import os
                     file = None
                     if os.path.exists(gif_path):
                         try:
@@ -252,6 +409,22 @@ class MusicCog(commands.Cog):
                         g_queue.now_playing_message = await g_queue.text_channel.send(embed=embed, file=file, view=MusicPlayerView(self, guild_id))
                     else:
                         g_queue.now_playing_message = await g_queue.text_channel.send(embed=embed, view=MusicPlayerView(self, guild_id))
+
+                # DM notifications
+                for user_id in g_queue.notify_users:
+                    try:
+                        user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+                        if user:
+                            dm_embed = discord.Embed(
+                                title="🔔 Your Song Is Playing!",
+                                description=f"**{song_to_play.title}** is now playing in the server.",
+                                color=discord.Color.green()
+                            )
+                            if song_to_play.thumbnail:
+                                dm_embed.set_thumbnail(url=song_to_play.thumbnail)
+                            await user.send(embed=dm_embed)
+                    except Exception:
+                        pass
 
             except Exception as e:
                 logger.error(f"Error starting playback for {song_to_play.title}: {e}")
@@ -401,7 +574,9 @@ class MusicCog(commands.Cog):
         g_queue = self.get_guild_queue(interaction.guild_id)
         if g_queue.voice_client and (g_queue.voice_client.is_playing() or g_queue.voice_client.is_paused()):
             skipped_song = g_queue.current
-            g_queue.loop = False  # Disable loop temporarily for manually skipped track
+            old_mode = g_queue.loop_mode
+            if g_queue.loop_mode == "track":
+                g_queue.loop_mode = "off"  # Disable track loop for skip
             g_queue.voice_client.stop()  # Triggers after callback to play next
             title = skipped_song.title if skipped_song else "Current track"
             embed = discord.Embed(title="⏭️ Track Skipped", description=f"Skipped **{title}**", color=discord.Color.blue())
@@ -441,7 +616,8 @@ class MusicCog(commands.Cog):
         else:
             embed.add_field(name="📋 Upcoming Tracks", value="*No upcoming tracks in queue.*", inline=False)
 
-        embed.set_footer(text=f"Total Queued: {len(g_queue.queue)} tracks | Loop: {'On' if g_queue.loop else 'Off'}")
+        loop_display = {"off": "Off", "track": "Track", "queue": "Queue"}
+        embed.set_footer(text=f"Total Queued: {len(g_queue.queue)} tracks | Loop: {loop_display.get(g_queue.loop_mode, 'Off')}")
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="nowplaying", description="Show detailed information about the currently playing song.")
@@ -638,6 +814,169 @@ class MusicCog(commands.Cog):
         except Exception as e:
             return await interaction.followup.send(f"❌ Error fetching lyrics: {e}")
 
+    @app_commands.command(name="loop", description="Cycle loop mode: Off -> Track -> Queue.")
+    async def loop(self, interaction: discord.Interaction):
+        g_queue = self.get_guild_queue(interaction.guild_id)
+        cycle = {"off": "track", "track": "queue", "queue": "off"}
+        g_queue.loop_mode = cycle.get(g_queue.loop_mode, "off")
+        icons = {"off": "➡️", "track": "🔂", "queue": "🔁"}
+        labels = {"off": "Off", "track": "Track Loop", "queue": "Queue Loop"}
+        await interaction.response.send_message(
+            f"{icons[g_queue.loop_mode]} Loop mode set to **{labels[g_queue.loop_mode]}**."
+        )
+
+    @app_commands.command(name="seek", description="Jump to a specific timestamp in the current track.")
+    @app_commands.describe(timestamp="Timestamp to jump to (e.g. 1:30 or 90)")
+    async def seek(self, interaction: discord.Interaction, timestamp: str):
+        """Seek to a position in the current track by restarting FFmpeg with -ss."""
+        g_queue = self.get_guild_queue(interaction.guild_id)
+        if not g_queue.current or not g_queue.voice_client:
+            return await interaction.response.send_message("⚠️ Nothing is playing.", ephemeral=True)
+
+        # Parse timestamp
+        parts = timestamp.strip().split(":")
+        try:
+            if len(parts) == 1:
+                seconds = int(parts[0])
+            elif len(parts) == 2:
+                seconds = int(parts[0]) * 60 + int(parts[1])
+            elif len(parts) == 3:
+                seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            else:
+                raise ValueError()
+        except (ValueError, IndexError):
+            return await interaction.response.send_message("⚠️ Invalid timestamp. Use format like `1:30` or `90`.", ephemeral=True)
+
+        if seconds < 0 or (g_queue.current.duration and seconds > g_queue.current.duration):
+            return await interaction.response.send_message("⚠️ Timestamp is out of range.", ephemeral=True)
+
+        await interaction.response.defer()
+
+        song = g_queue.current
+        # Build new FFmpeg source with -ss seek
+        ffmpeg_options = self.youtube_service.FFMPEG_OPTIONS.copy()
+        before_opts = ffmpeg_options.get('before_options', '')
+        before_opts = f"{before_opts} -ss {seconds}"
+        ffmpeg_options['before_options'] = before_opts
+        if g_queue.filter_options:
+            ffmpeg_options['options'] = f"{ffmpeg_options.get('options', '-vn')} -af \"{g_queue.filter_options}\""
+
+        source = discord.FFmpegPCMAudio(song.stream_url, **ffmpeg_options)
+        transformed = discord.PCMVolumeTransformer(source, volume=g_queue.volume)
+
+        # Stop current playback without triggering _play_next
+        # We do this by temporarily setting loop_mode to track so _play_next replays
+        old_loop = g_queue.loop_mode
+        g_queue.loop_mode = "track"  # prevent queue advancement
+
+        if g_queue.voice_client.is_playing() or g_queue.voice_client.is_paused():
+            g_queue.voice_client.stop()
+            # Wait a moment for the stop to process
+            await asyncio.sleep(0.5)
+
+        g_queue.loop_mode = old_loop  # restore
+        g_queue.play_start_time = time.time() - seconds
+
+        def after_callback(err):
+            fut = asyncio.run_coroutine_threadsafe(
+                self._play_next(interaction.guild_id, err), self.bot.loop
+            )
+            try:
+                fut.result()
+            except Exception as e:
+                logger.error(f"Error in seek after_callback: {e}")
+
+        g_queue.voice_client.play(transformed, after=after_callback)
+
+        mins, secs = divmod(seconds, 60)
+        await interaction.followup.send(f"⏩ Jumped to **{mins}:{secs:02d}**")
+
+    @app_commands.command(name="stats", description="View listening stats for this server.")
+    async def stats(self, interaction: discord.Interaction):
+        stats = _load_stats()
+        gid = str(interaction.guild_id)
+        if gid not in stats or not stats[gid]["songs"]:
+            return await interaction.response.send_message("📊 No listening data recorded yet. Play some music!")
+
+        guild_stats = stats[gid]
+        # Top 10 songs
+        sorted_songs = sorted(guild_stats["songs"].items(), key=lambda x: x[1], reverse=True)[:10]
+        song_list = "\n".join([f"`{i+1}.` **{name}** — {count} plays" for i, (name, count) in enumerate(sorted_songs)])
+
+        # Top 5 users
+        sorted_users = sorted(guild_stats["users"].items(), key=lambda x: x[1], reverse=True)[:5]
+        user_list = "\n".join([f"`{i+1}.` <@{uid}> — {count} songs queued" for i, (uid, count) in enumerate(sorted_users)])
+
+        total_plays = sum(guild_stats["songs"].values())
+
+        embed = discord.Embed(
+            title="📊 Server Listening Stats",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="🏆 Most Played Songs", value=song_list or "None", inline=False)
+        embed.add_field(name="🎧 Top DJs", value=user_list or "None", inline=False)
+        embed.set_footer(text=f"Total plays recorded: {total_plays}")
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="notify", description="Toggle DM notifications when your requested song starts playing.")
+    async def notify(self, interaction: discord.Interaction):
+        g_queue = self.get_guild_queue(interaction.guild_id)
+        uid = interaction.user.id
+        if uid in g_queue.notify_users:
+            g_queue.notify_users.discard(uid)
+            await interaction.response.send_message("🔕 DM notifications **disabled**. You won't be notified when your songs play.", ephemeral=True)
+        else:
+            g_queue.notify_users.add(uid)
+            await interaction.response.send_message("🔔 DM notifications **enabled**! You'll get a DM when your requested song starts playing.", ephemeral=True)
+
+    @app_commands.command(name="dedicate", description="Dedicate the currently playing song to someone.")
+    @app_commands.describe(user="The person to dedicate the song to")
+    async def dedicate(self, interaction: discord.Interaction, user: discord.Member):
+        g_queue = self.get_guild_queue(interaction.guild_id)
+        if not g_queue.current:
+            return await interaction.response.send_message("⚠️ Nothing is playing right now.", ephemeral=True)
+
+        g_queue.dedication = {
+            "from": interaction.user.mention,
+            "to": user.mention
+        }
+
+        embed = discord.Embed(
+            title="💌 Song Dedication",
+            description=f"{interaction.user.mention} dedicated **{g_queue.current.title}** to {user.mention}!",
+            color=discord.Color.from_rgb(255, 105, 180)
+        )
+        if g_queue.current.thumbnail:
+            embed.set_thumbnail(url=g_queue.current.thumbnail)
+        await interaction.response.send_message(embed=embed)
+
+        # Also update the now playing embed if it exists
+        if g_queue.now_playing_message:
+            try:
+                old_embed = g_queue.now_playing_message.embeds[0] if g_queue.now_playing_message.embeds else None
+                if old_embed:
+                    old_embed.add_field(
+                        name="💌 Dedicated",
+                        value=f"From {interaction.user.mention} to {user.mention}",
+                        inline=False
+                    )
+                    await g_queue.now_playing_message.edit(embed=old_embed)
+            except Exception:
+                pass
+
+        # DM the recipient
+        try:
+            dm_embed = discord.Embed(
+                title="💌 Someone Dedicated a Song to You!",
+                description=f"**{interaction.user.display_name}** dedicated **{g_queue.current.title}** to you in **{interaction.guild.name}**!",
+                color=discord.Color.from_rgb(255, 105, 180)
+            )
+            if g_queue.current.thumbnail:
+                dm_embed.set_thumbnail(url=g_queue.current.thumbnail)
+            await user.send(embed=dm_embed)
+        except Exception:
+            pass
+
     @app_commands.command(name="features", description="View all the features and commands of Bifrost Music.")
     async def features(self, interaction: discord.Interaction):
         embed = discord.Embed(
@@ -650,12 +989,12 @@ class MusicCog(commands.Cog):
             
         embed.add_field(
             name="🎵 Playback Commands",
-            value="`/play` - Play a song or Spotify playlist\n`/pause` - Pause music\n`/resume` - Resume music\n`/skip` - Skip track\n`/stop` - Stop and disconnect\n`/nowplaying` - View the current track details",
+            value="`/play` - Play a song or Spotify playlist\n`/pause` - Pause music\n`/resume` - Resume music\n`/skip` - Skip track\n`/stop` - Stop and disconnect\n`/nowplaying` - View the current track details\n`/seek <time>` - Jump to a timestamp\n`/loop` - Cycle loop mode (Off/Track/Queue)",
             inline=False
         )
         embed.add_field(
             name="🎛️ Audio Controls",
-            value="`/volume <0-200>` - Adjust volume\n`/bass` - Enable standard bass boost\n`/ultrabass` - Enable extreme bass boost\n`/clearfilters` - Remove all audio filters",
+            value="`/volume <0-100>` - Adjust volume\n`/bass` - Enable standard bass boost\n`/ultrabass` - Enable extreme bass boost\n`/clearfilters` - Remove all audio filters",
             inline=False
         )
         embed.add_field(
@@ -665,7 +1004,7 @@ class MusicCog(commands.Cog):
         )
         embed.add_field(
             name="✨ Premium Features",
-            value="♾️ **Autoplay**: Toggle endless radio mode with `/autoplay`\n🎤 **Lyrics**: Fetch lyrics with `/lyrics`\n🔘 **Interactive UI**: Control playback directly from the Now Playing embed buttons",
+            value="♾️ `/autoplay` - Endless radio mode\n🎤 `/lyrics` - Fetch song lyrics\n📊 `/stats` - Server listening leaderboard\n🔔 `/notify` - DM when your song plays\n💌 `/dedicate @user` - Dedicate a song\n🔘 **Interactive UI** - Buttons on Now Playing embed",
             inline=False
         )
         embed.set_footer(text="Bifrost Music • Created for the best listening experience")
