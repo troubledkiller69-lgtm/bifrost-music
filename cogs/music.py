@@ -100,6 +100,7 @@ class MusicPlayerView(discord.ui.View):
         await self.cog.show_queue.callback(self.cog, interaction)
 
 STATS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "listening_stats.json")
+PLAYLIST_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "custom_playlists.json")
 
 def _load_stats() -> dict:
     if os.path.exists(STATS_FILE):
@@ -111,8 +112,27 @@ def _load_stats() -> dict:
     return {}
 
 def _save_stats(data: dict):
-    with open(STATS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    try:
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        logger.error(f"Failed to save stats: {e}")
+
+def _load_playlists() -> dict:
+    if os.path.exists(PLAYLIST_FILE):
+        try:
+            with open(PLAYLIST_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_playlists(data: dict):
+    try:
+        with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        logger.error(f"Failed to save playlists: {e}")
 
 def _record_play(guild_id: int, song_title: str, requester: str):
     stats = _load_stats()
@@ -127,14 +147,101 @@ def _record_play(guild_id: int, song_title: str, requester: str):
     users[clean] = users.get(clean, 0) + 1
     _save_stats(stats)
 
+class PlaylistGroup(app_commands.Group):
+    """Group for custom playlist commands."""
+    
+    def __init__(self, cog: 'MusicCog'):
+        super().__init__(name="playlist", description="Manage custom server playlists")
+        self.cog = cog
+
+    @app_commands.command(name="save", description="Save the current queue as a custom playlist.")
+    @app_commands.describe(name="The name of the playlist to save")
+    async def save_playlist(self, interaction: discord.Interaction, name: str):
+        g_queue = self.cog.get_guild_queue(interaction.guild_id)
+        if not g_queue.current and not g_queue.queue:
+            return await interaction.response.send_message("⚠️ The queue is empty. Nothing to save.", ephemeral=True)
+            
+        tracks = []
+        if g_queue.current:
+            tracks.append(f"{g_queue.current.uploader} - {g_queue.current.title}")
+        for song in g_queue.queue:
+            tracks.append(f"{song.uploader} - {song.title}")
+            
+        playlists = _load_playlists()
+        gid = str(interaction.guild_id)
+        if gid not in playlists:
+            playlists[gid] = {}
+            
+        playlists[gid][name.lower()] = tracks
+        _save_playlists(playlists)
+        
+        embed = discord.Embed(
+            title="💾 Playlist Saved",
+            description=f"Saved **{len(tracks)}** tracks to playlist `{name}`.",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="play", description="Load and play a custom saved playlist.")
+    @app_commands.describe(name="The name of the playlist to play")
+    async def play_playlist(self, interaction: discord.Interaction, name: str):
+        playlists = _load_playlists()
+        gid = str(interaction.guild_id)
+        
+        if gid not in playlists or name.lower() not in playlists[gid]:
+            return await interaction.response.send_message(f"⚠️ Playlist `{name}` not found. Did you save it?", ephemeral=True)
+            
+        queries = playlists[gid][name.lower()]
+        if not queries:
+            return await interaction.response.send_message(f"⚠️ Playlist `{name}` is empty.", ephemeral=True)
+            
+        g_queue = self.cog.get_guild_queue(interaction.guild_id)
+        g_queue.text_channel = interaction.channel
+        
+        await interaction.response.defer()
+        
+        voice_client = await self.cog._ensure_voice_connection(interaction, g_queue)
+        if not voice_client:
+            return
+            
+        first_query = queries[0]
+        first_song = await self.cog.youtube_service.extract_song(first_query, interaction.user.mention)
+        
+        if not first_song:
+            embed = discord.Embed(
+                title="❌ Error",
+                description=f"Could not load the first track from the playlist.",
+                color=discord.Color.red()
+            )
+            return await interaction.followup.send(embed=embed)
+            
+        g_queue.queue.append(first_song)
+        start_playing = False
+        if not voice_client.is_playing() and not voice_client.is_paused() and g_queue.current is None:
+            start_playing = True
+            
+        embed = discord.Embed(
+            title="🎵 Custom Playlist Enqueued",
+            description=f"Loading `{name}`: Enqueued 1 of {len(queries)} tracks: **[{first_song.title}]({first_song.webpage_url})**\nResolving remaining tracks in background...",
+            color=discord.Color.green()
+        )
+        await interaction.followup.send(embed=embed)
+        
+        if start_playing:
+            await self.cog._play_next(interaction.guild_id)
+            
+        if len(queries) > 1:
+            asyncio.create_task(self.cog._process_playlist_background(interaction.guild_id, queries[1:], interaction.user.mention))
+
 class MusicCog(commands.Cog):
     """Cog handling music playback, voice connections, and slash commands."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.bot.tree.add_command(PlaylistGroup(self))
+        self.guild_queues: Dict[int, GuildQueue] = {}
         self.spotify_service = SpotifyService()
         self.youtube_service = YouTubeService()
-        self.guild_queues: Dict[int, GuildQueue] = {}
 
     def get_guild_queue(self, guild_id: int) -> GuildQueue:
         """Retrieve or create a GuildQueue instance for the given guild."""
@@ -750,6 +857,34 @@ class MusicCog(commands.Cog):
         embed = discord.Embed(title="🧹 Filters Cleared", description="All audio filters have been removed. Normal playback will resume on the **next track**.", color=discord.Color.green())
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(name="nightcore", description="Apply Nightcore filter (speed up + pitch up).")
+    async def nightcore(self, interaction: discord.Interaction):
+        g_queue = self.get_guild_queue(interaction.guild_id)
+        g_queue.filter_options = "atempo=1.2,asetrate=44100*1.25"
+        embed = discord.Embed(title="✨ Nightcore Enabled", description="Nightcore filter will be applied starting from the **next track**.", color=discord.Color.magenta())
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="vaporwave", description="Apply Vaporwave filter (slow down + pitch down + reverb).")
+    async def vaporwave(self, interaction: discord.Interaction):
+        g_queue = self.get_guild_queue(interaction.guild_id)
+        g_queue.filter_options = "atempo=0.8,asetrate=44100*0.8,aecho=0.8:0.9:1000:0.3"
+        embed = discord.Embed(title="🌴 Vaporwave Enabled", description="Vaporwave filter will be applied starting from the **next track**.", color=discord.Color.teal())
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="8d", description="Apply 8D Audio panning filter.")
+    async def eight_d(self, interaction: discord.Interaction):
+        g_queue = self.get_guild_queue(interaction.guild_id)
+        g_queue.filter_options = "apulsator=hz=0.125"
+        embed = discord.Embed(title="🎧 8D Audio Enabled", description="8D Audio panning will be applied starting from the **next track**.", color=discord.Color.blue())
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="karaoke", description="Apply Karaoke filter (attempts to remove vocals).")
+    async def karaoke(self, interaction: discord.Interaction):
+        g_queue = self.get_guild_queue(interaction.guild_id)
+        g_queue.filter_options = "pan=stereo|c0=c0-c1|c1=c1-c0"
+        embed = discord.Embed(title="🎤 Karaoke Enabled", description="Vocal removal will be attempted starting from the **next track**.", color=discord.Color.gold())
+        await interaction.response.send_message(embed=embed)
+
     @app_commands.command(name="shuffle", description="Shuffle the upcoming queue.")
     async def shuffle(self, interaction: discord.Interaction):
         g_queue = self.get_guild_queue(interaction.guild_id)
@@ -1292,7 +1427,7 @@ class MusicCog(commands.Cog):
         )
         embed.add_field(
             name="🎛️ Audio Controls",
-            value="`/volume <0-100>` - Adjust volume\n`/bass` - Enable standard bass boost\n`/ultrabass` - Enable extreme bass boost\n`/clearfilters` - Remove all audio filters",
+            value="`/volume <0-100>` - Adjust volume\n`/bass` - Enable standard bass boost\n`/ultrabass` - Enable extreme bass boost\n`/nightcore` - Speed & pitch up\n`/vaporwave` - Slow, pitch down, reverb\n`/8d` - 3D audio panning\n`/karaoke` - Remove center vocals\n`/clearfilters` - Remove all audio filters",
             inline=False
         )
         embed.add_field(
@@ -1302,7 +1437,7 @@ class MusicCog(commands.Cog):
         )
         embed.add_field(
             name="✨ Premium Features",
-            value="♾️ `/autoplay` - Endless radio mode\n🎤 `/lyrics` - Fetch song lyrics\n📊 `/stats` - Server listening leaderboard\n🔔 `/notify` - DM when your song plays\n💌 `/dedicate @user` - Dedicate a song\n🏆 `/quiz` - Song guessing game\n🔘 **Interactive UI** - Buttons on Now Playing embed",
+            value="♾️ `/autoplay` - Endless radio mode\n🎤 `/lyrics` - Fetch song lyrics\n📊 `/stats` - Server listening leaderboard\n🔔 `/notify` - DM when your song plays\n💌 `/dedicate @user` - Dedicate a song\n🏆 `/quiz` - Song guessing game\n💽 `/playlist save|play` - Save and load custom queues\n🔘 **Interactive UI** - Buttons on Now Playing embed",
             inline=False
         )
         embed.set_footer(text="Bifrost Music • Created for the best listening experience")
