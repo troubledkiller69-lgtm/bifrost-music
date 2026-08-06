@@ -2,7 +2,10 @@ import asyncio
 import json
 import logging
 import os
+import re as _re_module
+import random
 import time
+from collections import defaultdict
 from typing import Dict, Optional, List, Set
 import discord
 from discord import app_commands
@@ -32,6 +35,13 @@ class GuildQueue:
         self.dedication: Optional[dict] = None  # {"from": user, "to": member}
         self.play_start_time: Optional[float] = None  # epoch time when current track started
         self.autoplay_history: List[str] = []  # titles of recently played songs for dedup
+        # Round Robin state
+        self.round_robin: bool = False
+        self._rr_last_requester: Optional[str] = None  # last requester who got a song played
+        # Quiz state
+        self.quiz_active: bool = False
+        self.quiz_answer: Optional[str] = None  # current round's answer
+        self.quiz_scores: Dict[int, int] = {}  # user_id -> score
 
     def clear(self):
         """Reset queue state."""
@@ -41,6 +51,9 @@ class GuildQueue:
         self.dedication = None
         self.play_start_time = None
         self.autoplay_history.clear()
+        self.quiz_active = False
+        self.quiz_answer = None
+        self.quiz_scores = {}
 
 class MusicPlayerView(discord.ui.View):
     def __init__(self, cog: 'MusicCog', guild_id: int):
@@ -223,7 +236,10 @@ class MusicCog(commands.Cog):
                 g_queue.current = g_queue.queue.pop(0)
                 song_to_play = g_queue.current
             elif g_queue.queue:
-                g_queue.current = g_queue.queue.pop(0)
+                if g_queue.round_robin:
+                    g_queue.current = self._pop_round_robin(g_queue)
+                else:
+                    g_queue.current = g_queue.queue.pop(0)
                 song_to_play = g_queue.current
             elif getattr(g_queue, 'autoplay', False) and old_song:
                 if g_queue.text_channel:
@@ -977,6 +993,288 @@ class MusicCog(commands.Cog):
         except Exception:
             pass
 
+    # ── Round Robin ──────────────────────────────────────────────────────────
+
+    def _pop_round_robin(self, g_queue: GuildQueue) -> Song:
+        """Pop the next song using round-robin rotation between requesters.
+        
+        Cycles through unique requesters so no single user dominates the queue.
+        If the next user in rotation has no songs left, skip to the next user who does.
+        """
+        # Build ordered list of unique requesters who still have songs in queue
+        requesters_in_queue = []
+        seen = set()
+        for song in g_queue.queue:
+            if song.requester not in seen:
+                seen.add(song.requester)
+                requesters_in_queue.append(song.requester)
+
+        if not requesters_in_queue:
+            return g_queue.queue.pop(0)  # fallback
+
+        # Find who played last, pick the next person in rotation
+        last = g_queue._rr_last_requester
+        if last in requesters_in_queue:
+            idx = (requesters_in_queue.index(last) + 1) % len(requesters_in_queue)
+        else:
+            idx = 0
+        next_requester = requesters_in_queue[idx]
+
+        # Find that requester's first song in the queue and pop it
+        for i, song in enumerate(g_queue.queue):
+            if song.requester == next_requester:
+                g_queue._rr_last_requester = next_requester
+                return g_queue.queue.pop(i)
+
+        # Shouldn't happen, but fallback
+        return g_queue.queue.pop(0)
+
+    @app_commands.command(name="roundrobin", description="Toggle fair queue mode. Alternates songs between users instead of first-come-first-served.")
+    async def roundrobin(self, interaction: discord.Interaction):
+        """Toggle round-robin fair queue mode."""
+        g_queue = self.get_guild_queue(interaction.guild_id)
+        g_queue.round_robin = not g_queue.round_robin
+        g_queue._rr_last_requester = None  # reset rotation
+
+        if g_queue.round_robin:
+            embed = discord.Embed(
+                title="⚖️ Fair Queue Enabled",
+                description="The queue will now alternate between users so everyone gets a turn to DJ.",
+                color=discord.Color.green()
+            )
+        else:
+            embed = discord.Embed(
+                title="⚖️ Fair Queue Disabled",
+                description="Queue is back to first-come-first-served.",
+                color=discord.Color.gold()
+            )
+        await interaction.response.send_message(embed=embed)
+
+    # ── Song Quiz ────────────────────────────────────────────────────────────
+
+    # Default quiz songs if the server has no listening history
+    DEFAULT_QUIZ_SONGS = [
+        "Bohemian Rhapsody", "Hotel California", "Stairway to Heaven",
+        "Smells Like Teen Spirit", "Billie Jean", "Hey Jude",
+        "Wonderwall", "Sweet Child O Mine", "Losing My Religion",
+        "Under the Bridge", "Creep", "Mr Brightside",
+        "Somebody That I Used To Know", "Rolling in the Deep",
+        "Blinding Lights", "Shape of You", "Uptown Funk",
+        "Old Town Road", "Bad Guy", "Sunflower",
+        "Stressed Out", "Radioactive", "Thunder",
+        "Happier", "Circles", "Peaches", "Levitating",
+        "drivers license", "Stay", "Watermelon Sugar",
+        "Bohemian Like You", "Take Me Out", "Seven Nation Army",
+        "Feel Good Inc", "Clint Eastwood", "Hysteria",
+        "In The End", "Numb", "Crawling",
+        "Chop Suey", "Toxicity", "B.Y.O.B.",
+        "Enter Sandman", "Nothing Else Matters", "One",
+        "Lose Yourself", "Stan", "Without Me",
+        "HUMBLE", "Alright", "DNA",
+    ]
+
+    @staticmethod
+    def _fuzzy_match(guess: str, answer: str) -> bool:
+        """Check if a guess is close enough to the answer.
+        
+        Strips punctuation, lowercases, and checks for substring containment
+        or high word overlap.
+        """
+        def clean(s: str) -> str:
+            s = s.lower().strip()
+            s = _re_module.sub(r'[^a-z0-9\s]', '', s)
+            s = _re_module.sub(r'\s+', ' ', s)
+            return s
+
+        clean_guess = clean(guess)
+        clean_answer = clean(answer)
+
+        if not clean_guess or not clean_answer:
+            return False
+
+        # Exact match
+        if clean_guess == clean_answer:
+            return True
+
+        # Substring: if the answer is fully contained in the guess or vice versa
+        if clean_answer in clean_guess or clean_guess in clean_answer:
+            return True
+
+        # Word overlap: if 60%+ of the answer's words appear in the guess
+        answer_words = set(clean_answer.split())
+        guess_words = set(clean_guess.split())
+        if len(answer_words) > 0:
+            overlap = len(answer_words & guess_words) / len(answer_words)
+            if overlap >= 0.6:
+                return True
+
+        return False
+
+    @app_commands.command(name="quiz", description="Start a song guessing game! The bot plays clips and you guess the song.")
+    @app_commands.describe(rounds="Number of rounds to play (default: 5, max: 15)")
+    async def quiz(self, interaction: discord.Interaction, rounds: Optional[int] = 5):
+        """Song quiz mini-game. Plays short clips, users guess in chat."""
+        g_queue = self.get_guild_queue(interaction.guild_id)
+
+        if g_queue.quiz_active:
+            return await interaction.response.send_message("⚠️ A quiz is already running! Wait for it to finish.", ephemeral=True)
+
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            return await interaction.response.send_message("⚠️ You need to be in a voice channel to start a quiz.", ephemeral=True)
+
+        rounds = max(1, min(rounds or 5, 15))
+
+        await interaction.response.defer()
+
+        # Connect to voice if needed
+        voice_client = await self._ensure_voice_connection(interaction, g_queue)
+        if not voice_client:
+            return
+
+        g_queue.quiz_active = True
+        g_queue.quiz_scores = {}
+        g_queue.text_channel = interaction.channel
+
+        # Build song pool: prefer server listening history, fall back to defaults
+        stats = _load_stats()
+        gid = str(interaction.guild_id)
+        song_pool = []
+        if gid in stats and stats[gid].get("songs"):
+            song_pool = list(stats[gid]["songs"].keys())
+        if len(song_pool) < rounds:
+            song_pool.extend(self.DEFAULT_QUIZ_SONGS)
+
+        # Remove dupes and shuffle
+        seen_titles = set()
+        unique_pool = []
+        for s in song_pool:
+            if s.lower() not in seen_titles:
+                seen_titles.add(s.lower())
+                unique_pool.append(s)
+        random.shuffle(unique_pool)
+        quiz_songs = unique_pool[:rounds]
+
+        embed = discord.Embed(
+            title="🏆 Song Quiz Starting!",
+            description=f"**{rounds} rounds** — I'll play a 20-second clip and you type the song name in chat.\nFirst correct guess gets the point!",
+            color=discord.Color.gold()
+        )
+        await interaction.followup.send(embed=embed)
+        await asyncio.sleep(3)
+
+        for round_num, song_query in enumerate(quiz_songs, start=1):
+            if not g_queue.quiz_active:
+                break  # quiz was cancelled
+
+            # Announce round
+            round_embed = discord.Embed(
+                title=f"🎵 Round {round_num}/{rounds}",
+                description="Listen to the clip and type your guess!",
+                color=discord.Color.blue()
+            )
+            await g_queue.text_channel.send(embed=round_embed)
+
+            # Extract the song
+            try:
+                song = await self.youtube_service.extract_song(song_query, "🏆 Quiz")
+            except Exception:
+                song = None
+
+            if not song:
+                await g_queue.text_channel.send(f"*Skipping round {round_num} — couldn't load the track.*")
+                continue
+
+            # Set the answer (clean the title for matching)
+            # Strip common YouTube junk from the answer
+            answer_raw = song.title
+            for pattern in [
+                r'\(Official.*?\)', r'\[Official.*?\]',
+                r'\(Lyrics?\)', r'\[Lyrics?\]',
+                r'\(Audio\)', r'\[Audio\]',
+                r'\(Explicit\)', r'\[Explicit\]',
+                r'\(HD\)', r'\[HD\]', r'\(HQ\)', r'\[HQ\]',
+                r'official audio', r'official video', r'official music video',
+                r'lyric video', r'\bHQ\b', r'\bHD\b',
+            ]:
+                answer_raw = _re_module.sub(pattern, '', answer_raw, flags=_re_module.IGNORECASE)
+            g_queue.quiz_answer = answer_raw.strip().strip('-').strip()
+
+            # Play a 20-second clip starting partway into the song
+            ffmpeg_options = self.youtube_service.FFMPEG_OPTIONS.copy()
+            # Start between 20-60 seconds in (or 10s if short song)
+            start_at = random.randint(10, max(10, min(60, (song.duration or 120) - 30)))
+            ffmpeg_options['before_options'] = f"{ffmpeg_options.get('before_options', '')} -ss {start_at}"
+            ffmpeg_options['options'] = f"{ffmpeg_options.get('options', '-vn')} -t 20"
+
+            source = discord.FFmpegPCMAudio(song.stream_url, **ffmpeg_options)
+            transformed = discord.PCMVolumeTransformer(source, volume=g_queue.volume)
+
+            # Stop any current playback
+            if voice_client.is_playing() or voice_client.is_paused():
+                voice_client.stop()
+                await asyncio.sleep(0.3)
+
+            voice_client.play(transformed)
+
+            # Wait for guesses (30 seconds max)
+            round_winner = None
+            try:
+                def check(msg):
+                    if msg.channel.id != g_queue.text_channel.id:
+                        return False
+                    if msg.author.bot:
+                        return False
+                    return self._fuzzy_match(msg.content, g_queue.quiz_answer)
+
+                winner_msg = await self.bot.wait_for('message', check=check, timeout=30.0)
+                round_winner = winner_msg.author
+            except asyncio.TimeoutError:
+                pass
+
+            # Stop the clip if still playing
+            if voice_client.is_playing():
+                voice_client.stop()
+
+            # Announce result
+            if round_winner:
+                g_queue.quiz_scores[round_winner.id] = g_queue.quiz_scores.get(round_winner.id, 0) + 1
+                result_embed = discord.Embed(
+                    title="✅ Correct!",
+                    description=f"**{round_winner.display_name}** got it! The song was **{g_queue.quiz_answer}**",
+                    color=discord.Color.green()
+                )
+            else:
+                result_embed = discord.Embed(
+                    title="⏰ Time's Up!",
+                    description=f"Nobody got it. The song was **{g_queue.quiz_answer}**",
+                    color=discord.Color.red()
+                )
+            await g_queue.text_channel.send(embed=result_embed)
+            await asyncio.sleep(3)
+
+        # Quiz over — show scoreboard
+        g_queue.quiz_active = False
+        g_queue.quiz_answer = None
+
+        if g_queue.quiz_scores:
+            sorted_scores = sorted(g_queue.quiz_scores.items(), key=lambda x: x[1], reverse=True)
+            scoreboard = "\n".join(
+                [f"`{i+1}.` <@{uid}> — **{score}** point{'s' if score != 1 else ''}" for i, (uid, score) in enumerate(sorted_scores)]
+            )
+            winner_id = sorted_scores[0][0]
+            final_embed = discord.Embed(
+                title="🏆 Quiz Over!",
+                description=f"**<@{winner_id}> wins!**\n\n{scoreboard}",
+                color=discord.Color.gold()
+            )
+        else:
+            final_embed = discord.Embed(
+                title="🏆 Quiz Over!",
+                description="Nobody scored any points! Better luck next time.",
+                color=discord.Color.gold()
+            )
+        await g_queue.text_channel.send(embed=final_embed)
+
     @app_commands.command(name="features", description="View all the features and commands of Bifrost Music.")
     async def features(self, interaction: discord.Interaction):
         embed = discord.Embed(
@@ -999,12 +1297,12 @@ class MusicCog(commands.Cog):
         )
         embed.add_field(
             name="📜 Queue Management",
-            value="`/queue` - View upcoming songs\n`/shuffle` - Randomize the queue\n`/remove <index>` - Remove a specific song\n`/clear` - Wipe the entire queue",
+            value="`/queue` - View upcoming songs\n`/shuffle` - Randomize the queue\n`/remove <index>` - Remove a specific song\n`/clear` - Wipe the entire queue\n`/roundrobin` - Toggle fair queue (alternates between users)",
             inline=False
         )
         embed.add_field(
             name="✨ Premium Features",
-            value="♾️ `/autoplay` - Endless radio mode\n🎤 `/lyrics` - Fetch song lyrics\n📊 `/stats` - Server listening leaderboard\n🔔 `/notify` - DM when your song plays\n💌 `/dedicate @user` - Dedicate a song\n🔘 **Interactive UI** - Buttons on Now Playing embed",
+            value="♾️ `/autoplay` - Endless radio mode\n🎤 `/lyrics` - Fetch song lyrics\n📊 `/stats` - Server listening leaderboard\n🔔 `/notify` - DM when your song plays\n💌 `/dedicate @user` - Dedicate a song\n🏆 `/quiz` - Song guessing game\n🔘 **Interactive UI** - Buttons on Now Playing embed",
             inline=False
         )
         embed.set_footer(text="Bifrost Music • Created for the best listening experience")
