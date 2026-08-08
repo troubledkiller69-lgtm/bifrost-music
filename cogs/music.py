@@ -733,23 +733,32 @@ class MusicCog(commands.Cog):
         )
 
         if g_queue.current:
+            now_title = g_queue.current.title[:60] + ('...' if len(g_queue.current.title) > 60 else '')
             embed.add_field(
-                name="🔊 Now Playing",
-                value=f"**[{g_queue.current.title}]({g_queue.current.webpage_url})** | `{g_queue.current.formatted_duration}` | Requested by {g_queue.current.requester}",
+                name="🎶 Now Playing",
+                value=f"**{now_title}** | `{g_queue.current.formatted_duration}` | {g_queue.current.requester}",
                 inline=False
             )
         else:
-            embed.add_field(name="🔊 Now Playing", value="*Nothing is playing right now.*", inline=False)
+            embed.add_field(name="🎶 Now Playing", value="*Nothing is playing right now.*", inline=False)
 
         if g_queue.queue:
-            queue_description = ""
-            for idx, song in enumerate(g_queue.queue[:10], start=1):
-                queue_description += f"`{idx}.` **[{song.title}]({song.webpage_url})** | `{song.formatted_duration}`\n"
-            
-            if len(g_queue.queue) > 10:
-                queue_description += f"\n*...and {len(g_queue.queue) - 10} more track(s)*"
+            queue_lines = []
+            char_count = 0
+            display_count = min(len(g_queue.queue), 15)
+            for idx, song in enumerate(g_queue.queue[:display_count], start=1):
+                title_trunc = song.title[:50] + ('...' if len(song.title) > 50 else '')
+                line = f"`{idx}.` **{title_trunc}** | `{song.formatted_duration}`"
+                if char_count + len(line) + 1 > 950:
+                    queue_lines.append(f"*...and {len(g_queue.queue) - idx + 1} more track(s)*")
+                    break
+                queue_lines.append(line)
+                char_count += len(line) + 1
+            else:
+                if len(g_queue.queue) > display_count:
+                    queue_lines.append(f"\n*...and {len(g_queue.queue) - display_count} more track(s)*")
 
-            embed.add_field(name="📋 Upcoming Tracks", value=queue_description, inline=False)
+            embed.add_field(name="📋 Upcoming Tracks", value="\n".join(queue_lines), inline=False)
         else:
             embed.add_field(name="📋 Upcoming Tracks", value="*No upcoming tracks in queue.*", inline=False)
 
@@ -1226,36 +1235,58 @@ class MusicCog(commands.Cog):
     def _fuzzy_match(guess: str, answer: str) -> bool:
         """Check if a guess is close enough to the answer.
         
-        Strips punctuation, lowercases, and checks for substring containment
-        or high word overlap.
+        Strips punctuation, lowercases, handles 'Artist - Song' format,
+        and checks for substring containment or high word overlap.
         """
         def clean(s: str) -> str:
             s = s.lower().strip()
             s = _re_module.sub(r'[^a-z0-9\s]', '', s)
             s = _re_module.sub(r'\s+', ' ', s)
-            return s
+            return s.strip()
 
         clean_guess = clean(guess)
-        clean_answer = clean(answer)
+        
+        # Build a list of possible correct answers from the raw answer
+        # e.g. "Dreamville - Heaven's EP (with J. Cole)" produces:
+        #   - the full cleaned string
+        #   - just the song part after " - "
+        #   - just the artist part before " - "
+        possible_answers = [clean(answer)]
+        if ' - ' in answer:
+            parts = answer.split(' - ', 1)
+            possible_answers.append(clean(parts[0]))  # artist
+            possible_answers.append(clean(parts[1]))  # song title
+        # Also try stripping featured artist tags like (with X), (feat. X), (ft. X)
+        stripped = _re_module.sub(r'\s*[\(\[](?:with|feat\.?|ft\.?).*?[\)\]]', '', answer, flags=_re_module.IGNORECASE)
+        if clean(stripped) not in possible_answers:
+            possible_answers.append(clean(stripped))
+        if ' - ' in stripped:
+            song_part = stripped.split(' - ', 1)[1]
+            if clean(song_part) not in possible_answers:
+                possible_answers.append(clean(song_part))
 
-        if not clean_guess or not clean_answer:
+        if not clean_guess:
             return False
 
-        # Exact match
-        if clean_guess == clean_answer:
-            return True
+        for clean_answer in possible_answers:
+            if not clean_answer:
+                continue
 
-        # Substring: if the answer is fully contained in the guess or vice versa
-        if clean_answer in clean_guess or clean_guess in clean_answer:
-            return True
-
-        # Word overlap: if 60%+ of the answer's words appear in the guess
-        answer_words = set(clean_answer.split())
-        guess_words = set(clean_guess.split())
-        if len(answer_words) > 0:
-            overlap = len(answer_words & guess_words) / len(answer_words)
-            if overlap >= 0.6:
+            # Exact match
+            if clean_guess == clean_answer:
                 return True
+
+            # Substring: if the answer is fully contained in the guess or vice versa
+            if clean_answer in clean_guess or clean_guess in clean_answer:
+                return True
+
+            # Word overlap: if 50%+ of the answer's words appear in the guess
+            answer_words = set(clean_answer.split())
+            guess_words = set(clean_guess.split())
+            if len(answer_words) > 0:
+                overlap = len(answer_words & guess_words) / len(answer_words)
+                if overlap >= 0.5:
+                    return True
 
         return False
 
