@@ -467,6 +467,22 @@ class MusicCog(commands.Cog):
                 return
 
             try:
+                # Re-extract if stream URL is older than 3 hours (10,800 seconds)
+                if time.time() - song_to_play.added_at > 10800:
+                    logger.info(f"Stream URL for '{song_to_play.title}' expired. Re-extracting...")
+                    if g_queue.text_channel:
+                        await g_queue.text_channel.send(f"🔄 Re-extracting expired URL for **{song_to_play.title}**...", delete_after=3)
+                    fresh_song = await self.youtube_service.extract_song(song_to_play.webpage_url, song_to_play.requester)
+                    if fresh_song:
+                        song_to_play = fresh_song
+                        g_queue.current = song_to_play
+                    else:
+                        logger.error(f"Failed to re-extract '{song_to_play.title}'")
+                        if g_queue.text_channel:
+                            await g_queue.text_channel.send(f"❌ Failed to play track **{song_to_play.title}**. Skipping...")
+                        asyncio.create_task(self._play_next(guild_id))
+                        return
+
                 # Construct FFmpeg audio source
                 ffmpeg_options = self.youtube_service.FFMPEG_OPTIONS.copy()
                 if g_queue.filter_options:
@@ -479,13 +495,11 @@ class MusicCog(commands.Cog):
                 transformed_source = discord.PCMVolumeTransformer(source, volume=g_queue.volume)
 
                 def after_callback(err):
-                    fut = asyncio.run_coroutine_threadsafe(
+                    if err:
+                        logger.error(f"Playback error in after_callback: {err}")
+                    asyncio.run_coroutine_threadsafe(
                         self._play_next(guild_id, err), self.bot.loop
                     )
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        logger.error(f"Error in after_callback result: {e}")
 
                 g_queue.voice_client.play(transformed_source, after=after_callback)
                 g_queue.play_start_time = time.time()
@@ -553,7 +567,7 @@ class MusicCog(commands.Cog):
                 logger.error(f"Error starting playback for {song_to_play.title}: {e}")
                 if g_queue.text_channel:
                     await g_queue.text_channel.send(f"❌ Failed to play track **{song_to_play.title}**. Skipping...")
-                await self._play_next(guild_id)
+                asyncio.create_task(self._play_next(guild_id))
 
     @app_commands.command(name="play", description="Play a song or playlist from Spotify, YouTube, or search query.")
     @app_commands.describe(query="Spotify URL, YouTube URL, or search keywords")

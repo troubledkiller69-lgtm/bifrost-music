@@ -1,6 +1,7 @@
 import asyncio
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 import yt_dlp
 
@@ -17,6 +18,7 @@ class Song:
     thumbnail: str
     uploader: str
     requester: str
+    added_at: float = field(default_factory=time.time)
 
     @property
     def formatted_duration(self) -> str:
